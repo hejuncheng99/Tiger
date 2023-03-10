@@ -36,8 +36,7 @@ type SqlBuilder struct {
 	//查询返回行
 	rows *sql.Rows
 	//事务
-	Tx   *sql.Tx
-	stmt *sql.Stmt
+	Tx *sql.Tx
 	//上下文
 	Context context.Context
 }

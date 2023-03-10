@@ -3,7 +3,6 @@ package TIGER
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"log"
 	"reflect"
 	"strconv"
@@ -39,29 +38,20 @@ func NewMysql(Username string, Password string, Address string, Dbname string) (
 // Transaction 事务操作
 func (tg *DB) Transaction(fx func(db *DB) error) error {
 	tx, err := tg.sqlBuild.Db.Begin()
+	tg.sqlBuild.Tx = tx
 	if err != nil {
 		_ = tx.Rollback()
+		log.Printf("open transaction fail : %v", err)
 		return err
 	}
-
-	isCommit := true
-
 	//实际操作
-	defer tg.sqlBuild.stmt.Close()
 	if err := fx(tg); err != nil {
-		isCommit = false
+		_ = tx.Rollback()
+		log.Printf("run transaction fail : %v", err)
 		return err
 	}
-
-	if isCommit {
-		err = tx.Commit()
-		fmt.Println("transaction commit")
-		return err
-	} else {
-		err = tx.Rollback()
-		fmt.Println("transaction rollback")
-		return err
-	}
+	err = tx.Commit()
+	return nil
 }
 
 // Select 选取字段构建
@@ -73,12 +63,23 @@ func (tg *DB) Select(filed ...string) *DB {
 // From 查询表构建
 func (tg *DB) Table(name string) *DB {
 	if tg.sqlBuild.Builder.Len() != 0 {
-		tg = &DB{
-			sqlBuild: &SqlBuilder{
-				Db:      tg.sqlBuild.Db,
-				Builder: &strings.Builder{},
-			},
+		if tg.sqlBuild.Tx != nil {
+			tg = &DB{
+				sqlBuild: &SqlBuilder{
+					Db:      tg.sqlBuild.Db,
+					Builder: &strings.Builder{},
+					Tx:      tg.sqlBuild.Tx,
+				},
+			}
+		} else {
+			tg = &DB{
+				sqlBuild: &SqlBuilder{
+					Db:      tg.sqlBuild.Db,
+					Builder: &strings.Builder{},
+				},
+			}
 		}
+
 	}
 
 	tg.sqlBuild.tableName = name
