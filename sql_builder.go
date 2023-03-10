@@ -1,12 +1,14 @@
 package TIGER
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 )
 
 type SqlBuilder struct {
-	// 查询语句构建
+	Db *sql.DB
+	// 语句构建
 	Builder *strings.Builder
 	//需要查询的列
 	column []string
@@ -15,6 +17,8 @@ type SqlBuilder struct {
 	//查询条件
 	//where []func(s *SqlBuilder)
 	where *WhereExpr
+	//需更新的字段
+	UpdateParam string
 	//查询参数
 	args []any
 	//排序语句
@@ -31,6 +35,11 @@ type SqlBuilder struct {
 	RowsAffected int64
 	//查询返回行
 	rows *sql.Rows
+	//事务
+	Tx   *sql.Tx
+	stmt *sql.Stmt
+	//上下文
+	Context context.Context
 }
 
 type WhereExpr struct {

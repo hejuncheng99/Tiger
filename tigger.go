@@ -2,8 +2,8 @@ package TIGER
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
 	"log"
 	"reflect"
 	"strconv"
@@ -14,12 +14,7 @@ type Config struct {
 }
 type DB struct {
 	*Config
-	Db       *sql.DB
 	sqlBuild *SqlBuilder
-}
-
-// TigerEngine 引擎
-type TigerEngine struct {
 }
 
 func NewMysql(Username string, Password string, Address string, Dbname string) (*DB, error) {
@@ -33,27 +28,17 @@ func NewMysql(Username string, Password string, Address string, Dbname string) (
 	//最大连接数等配置，先占个位
 	//2.0版本支持了其他数据库呢；
 	//后续连接池的加入
-
-	//db.SetMaxOpenConns(3)
-	//db.SetMaxIdleConns(3)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(3)
 
 	return &DB{
-		Db:       db,
-		sqlBuild: &SqlBuilder{Builder: &strings.Builder{}},
+		sqlBuild: &SqlBuilder{Builder: &strings.Builder{}, Db: db},
 	}, nil
 }
 
-//func (e *TigerEngine) Save(v any) (ex *TigerEngine) {
-//
-//	db := TigerEngine{}
-//	db.Transaction(func(tx *sql.Tx) error {
-//		tx.
-//	})
-//}
-
 // Transaction 事务操作
-func (e *DB) Transaction(fx func(tx *sql.Tx) error) error {
-	tx, err := e.Db.Begin()
+func (tg *DB) Transaction(fx func(db *DB) error) error {
+	tx, err := tg.sqlBuild.Db.Begin()
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -62,7 +47,8 @@ func (e *DB) Transaction(fx func(tx *sql.Tx) error) error {
 	isCommit := true
 
 	//实际操作
-	if err := fx(tx); err != nil {
+	defer tg.sqlBuild.stmt.Close()
+	if err := fx(tg); err != nil {
 		isCommit = false
 		return err
 	}
@@ -85,7 +71,16 @@ func (tg *DB) Select(filed ...string) *DB {
 }
 
 // From 查询表构建
-func (tg *DB) From(name string) *DB {
+func (tg *DB) Table(name string) *DB {
+	if tg.sqlBuild.Builder.Len() != 0 {
+		tg = &DB{
+			sqlBuild: &SqlBuilder{
+				Db:      tg.sqlBuild.Db,
+				Builder: &strings.Builder{},
+			},
+		}
+	}
+
 	tg.sqlBuild.tableName = name
 	return tg
 }
@@ -156,8 +151,8 @@ func (tg *DB) Query() *DB {
 		tg.sqlBuild.Builder.WriteString(strconv.FormatInt(*tg.sqlBuild.limit, 10))
 	}
 
-	log.Printf(tg.sqlBuild.Builder.String())
-	rows, err := tg.Db.Query(tg.sqlBuild.Builder.String(), tg.sqlBuild.args...)
+	//log.Printf(tg.sqlBuild.Builder.String())
+	rows, err := tg.sqlBuild.Db.Query(tg.sqlBuild.Builder.String(), tg.sqlBuild.args...)
 	if err != nil {
 		log.Println(err)
 	}
@@ -182,6 +177,9 @@ func (tg *DB) ScanRows(dst any) error {
 	if val.Kind() != reflect.Ptr {
 		return DtsNotPointerError
 	}
+	if val.IsNil() {
+		return errors.New("参数不能是空指针！")
+	}
 
 	//指针指向value 获取具体的值
 	val = reflect.Indirect(val)
@@ -189,7 +187,7 @@ func (tg *DB) ScanRows(dst any) error {
 		return DtsNotSlice
 	}
 
-	//获取slice中的类型
+	//原始单个struct的类型
 	strPointer := val.Type().Elem()
 
 	//指针指向的类型，具体结构体
@@ -206,7 +204,7 @@ func (tg *DB) ScanRows(dst any) error {
 
 	//结构体的torm tag 的value对应结构体中的index
 	for i := 0; i < str.NumField(); i++ {
-		tagName := str.Field(i).Tag.Get("torm")
+		tagName := str.Field(i).Tag.Get("sql")
 		if tagName != "" {
 			tagIdx[tagName] = i
 		}
@@ -255,27 +253,182 @@ func (tg *DB) ScanRows(dst any) error {
 	return tg.sqlBuild.rows.Err()
 }
 
-func (tg *DB) Insert(obj any) int64 {
+// Insert 插入数据
+func (tg *DB) Insert(obj any) error {
 	tg.sqlBuild.Builder.WriteString("INSERT INTO")
+	tg.sqlBuild.Builder.WriteString(" " + tg.sqlBuild.tableName)
+	t := reflect.TypeOf(obj)
+	v := reflect.ValueOf(obj)
+	switch t.Kind() {
+	case reflect.Slice, reflect.Array:
+		//切片大小
+		l := v.Len()
+		for i := 0; i < l; i++ {
+			v := v.Index(i)
+			t := v.Type()
+			if i > 0 {
+				tg.sqlBuild.Builder.WriteString(",")
+			}
+			var placeholder []string
+			var fields []string
+			for j := 0; j < v.NumField(); j++ {
+				//获取字段
+				if i == 0 {
+					fields = append(fields, t.Field(j).Tag.Get("sql"))
+				}
+				//数据占位符和数据写入
+				placeholder = append(placeholder, "?")
+				tg.sqlBuild.args = append(tg.sqlBuild.args, v.Field(j).Interface())
 
-	tg.sqlBuild.Builder.WriteString(" " + tg.sqlBuild.tableName + "(")
-
-	for i, col := range tg.sqlBuild.column {
-		if i > 0 {
-			tg.sqlBuild.Builder.WriteString(",")
+			}
+			if i == 0 {
+				//字段写入
+				tg.sqlBuild.Builder.WriteString("(")
+				tg.sqlBuild.Builder.WriteString(strings.Join(fields, ","))
+				tg.sqlBuild.Builder.WriteString(")")
+				tg.sqlBuild.Builder.WriteString(" VALUES ")
+			}
+			//占位符
+			tg.sqlBuild.Builder.WriteString("(")
+			tg.sqlBuild.Builder.WriteString(strings.Join(placeholder, ","))
+			tg.sqlBuild.Builder.WriteString(")")
 		}
-		tg.sqlBuild.Builder.WriteString(col)
+	case reflect.Struct:
+		//字段列表
+		var placeholder []string
+		var fields []string
+		for i := 0; i < t.NumField(); i++ {
+			fields = append(fields, t.Field(i).Tag.Get("sql"))
+			placeholder = append(placeholder, "?")
+			tg.sqlBuild.args = append(tg.sqlBuild.args, v.Field(i).Interface())
+		}
+
+		tg.sqlBuild.Builder.WriteString("(")
+		tg.sqlBuild.Builder.WriteString(strings.Join(fields, ","))
+		tg.sqlBuild.Builder.WriteString(")")
+		tg.sqlBuild.Builder.WriteString("VALUE")
+		tg.sqlBuild.Builder.WriteString("(")
+		tg.sqlBuild.Builder.WriteString(strings.Join(placeholder, ","))
+		tg.sqlBuild.Builder.WriteString(")")
 	}
 
-	tg.sqlBuild.Builder.WriteString(")  ")
+	exp := tg.sqlBuild.Builder.String()
+	//log.Printf("SQL:%v", exp)
+	stmt, err := tg.sqlBuild.Db.Prepare(exp)
+	if err != nil {
+		log.Printf("Prepare Error :%v", err)
+		return err
+	}
+	exec, err := stmt.Exec(tg.sqlBuild.args...)
+	if err != nil {
+		log.Printf("Prepare Error :%v", err)
+		return err
+	}
+	id, _ := exec.LastInsertId()
+	log.Printf("exec.LastInsertId()：%v", id)
+	affected, _ := exec.RowsAffected()
+	log.Printf("affected：%v", affected)
 
-	tg.sqlBuild.Builder.WriteString("VALUES")
+	return nil
+}
 
-	//for _, arg := range tg.sqlBuild.args {
-	//	if  {
-	//
-	//	}
-	//}
+// Update 更新
+func (tg *DB) Update(obj ...any) (int64, error) {
+	var dataType int
+	if len(obj) == 1 {
+		dataType = 1
+	} else if len(obj) == 2 {
+		dataType = 2
+	} else {
+		return 0, errors.New("参数个数错误")
+	}
 
-	return 1
+	tg.sqlBuild.Builder.WriteString("UPDATE  ")
+	tg.sqlBuild.Builder.WriteString(tg.sqlBuild.tableName)
+	tg.sqlBuild.Builder.WriteString(" SET ")
+
+	//如果是结构体
+	if dataType == 1 {
+		t := reflect.TypeOf(obj[0])
+		v := reflect.ValueOf(obj[0])
+		var fieldNameArray []string
+		for i := 0; i < t.NumField(); i++ {
+			//首字母小写，不可反射
+			if !v.Field(i).CanInterface() {
+				continue
+			}
+			//解析tag，找出真实的sql字段名
+			sqlTag := t.Field(i).Tag.Get("sql")
+			if sqlTag != "" {
+				fieldNameArray = append(fieldNameArray, strings.Split(sqlTag, ",")[0]+"=?")
+			} else {
+				fieldNameArray = append(fieldNameArray, t.Field(i).Name+"=?")
+			}
+
+			tg.sqlBuild.args = append(tg.sqlBuild.args, v.Field(i).Interface())
+		}
+		tg.sqlBuild.Builder.WriteString(strings.Join(fieldNameArray, ","))
+
+	} else if dataType == 2 {
+		//直接=的情况
+		tg.sqlBuild.Builder.WriteString(obj[0].(string) + "=?")
+		tg.sqlBuild.args = append(tg.sqlBuild.args, obj[1])
+	}
+
+	if tg.sqlBuild.where.SQL != "" {
+		tg.sqlBuild.Builder.WriteString(" WHERE ")
+		tg.sqlBuild.Builder.WriteString(tg.sqlBuild.where.SQL)
+		tg.sqlBuild.args = append(tg.sqlBuild.args, tg.sqlBuild.where.Vars...)
+	}
+
+	if tg.sqlBuild.limit != nil {
+		tg.sqlBuild.Builder.WriteString(" LIMIT " + strconv.FormatInt(*tg.sqlBuild.limit, 10))
+	}
+	expr := tg.sqlBuild.Builder.String()
+	//log.Printf("SQL:%v", expr)
+	stmt, err := tg.sqlBuild.Db.Prepare(expr)
+	if err != nil {
+		log.Printf("update prepare err:%v", err.Error())
+		return 0, err
+	}
+
+	result, err := stmt.Exec(tg.sqlBuild.args...)
+	if err != nil {
+		log.Printf("update exec error : %v", err)
+		return 0, err
+	}
+	affected, _ := result.RowsAffected()
+
+	return affected, nil
+}
+
+// Delete 删除记录
+func (tg *DB) Delete() (int64, error) {
+	tg.sqlBuild.Builder.WriteString("DELETE FROM ")
+	tg.sqlBuild.Builder.WriteString(tg.sqlBuild.tableName)
+
+	if tg.sqlBuild.where.SQL != "" {
+		tg.sqlBuild.Builder.WriteString(" WHERE " + tg.sqlBuild.where.SQL)
+	}
+
+	if tg.sqlBuild.limit != nil {
+		tg.sqlBuild.Builder.WriteString(" LIMIT " + strconv.FormatInt(*tg.sqlBuild.limit, 10))
+	}
+	expr := tg.sqlBuild.Builder.String()
+	//log.Printf("SQL:%v", expr)
+	stmt, err := tg.sqlBuild.Db.Prepare(expr)
+	if err != nil {
+		log.Printf("delete prepare error:%v", err)
+		return 0, err
+	}
+
+	result, err := stmt.Exec(tg.sqlBuild.where.Vars...)
+	if err != nil {
+		log.Printf("delete exec error:%v", err)
+		return 0, err
+	}
+	//影响的行数
+	rowsAffected, _ := result.RowsAffected()
+
+	return rowsAffected, nil
 }
